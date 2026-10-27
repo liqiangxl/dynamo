@@ -3,9 +3,14 @@
 
 //! Keep consuming prefill while decode runs, and return failures to the caller.
 
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use dynamo_runtime::{
+    config::{env_is_truthy, environment_names::router::DYN_ROUTER_RELEASE_ON_KV_CONFIRMATION},
     error::{DynamoError, ErrorClass},
     pipeline::{AsyncEngineContext, AsyncEngineContextProvider, ManyOut, ResponseStream},
     protocols::{annotated::Annotated, maybe_error::MaybeError},
@@ -22,6 +27,113 @@ use crate::protocols::{
 
 /// Prefill's last `engine_data`.
 pub(super) type PrefillOutput = Option<serde_json::Value>;
+
+/// `disaggregated_params` key a decode worker sets on an output item once it has
+/// received the KV of every prefill rank (SGLang emits no decode token before
+/// that). The router strips it, so it never reaches clients.
+const KV_TRANSFER_KEY: &str = "kv_transfer";
+/// Value of [`KV_TRANSFER_KEY`] that confirms KV receipt.
+const KV_TRANSFER_RECEIVED: &str = "received";
+
+/// Process-wide opt-in for releasing a confirmed decode terminal without waiting
+/// for the prefill route ([`DYN_ROUTER_RELEASE_ON_KV_CONFIRMATION`]).
+static RELEASE_ON_KV_CONFIRMATION: LazyLock<bool> =
+    LazyLock::new(|| env_is_truthy(DYN_ROUTER_RELEASE_ON_KV_CONFIRMATION));
+
+/// Remove the decode's KV-receipt mark from `item` and report whether it was
+/// there. Other `disaggregated_params` keys are kept; an object left empty by
+/// the removal becomes `None`, as it was before the worker set the mark.
+fn take_kv_mark(item: &mut Option<Annotated<LLMEngineOutput>>) -> bool {
+    item.as_mut().is_some_and(take_item_kv_mark)
+}
+
+fn take_item_kv_mark(item: &mut Annotated<LLMEngineOutput>) -> bool {
+    let Some(data) = item.data.as_mut() else {
+        return false;
+    };
+    let Some(serde_json::Value::Object(params)) = data.disaggregated_params.as_mut() else {
+        return false;
+    };
+    let Some(mark) = params.remove(KV_TRANSFER_KEY) else {
+        return false;
+    };
+    if params.is_empty() {
+        data.disaggregated_params = None;
+    }
+    mark.as_str() == Some(KV_TRANSFER_RECEIVED)
+}
+
+/// Strip the KV-receipt mark from every item of a decode stream that the router
+/// forwards without inspecting it.
+pub(super) fn strip_kv_marks(
+    response: ManyOut<Annotated<LLMEngineOutput>>,
+) -> ManyOut<Annotated<LLMEngineOutput>> {
+    let context = response.context();
+    let stream = response.map(|mut item| {
+        take_item_kv_mark(&mut item);
+        item
+    });
+    ResponseStream::new(Box::pin(stream), context)
+}
+
+/// Upper bound on draining a decode stream after its early-released terminal
+/// item (only that path drains; the default hold path is unchanged). The worker
+/// sends its stream-level completion right after the terminal, so the drain
+/// normally ends at once; the bound only protects against a stalled worker.
+const DECODE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Read a decode stream to its end, discarding items, for at most
+/// [`DECODE_DRAIN_TIMEOUT`]. Dropping a stream before the worker's completion
+/// message arrives makes the worker log a failed publish of its final message.
+async fn drain_decode(stream: &mut ManyOut<Annotated<LLMEngineOutput>>) {
+    let drained = tokio::time::timeout(DECODE_DRAIN_TIMEOUT, async {
+        let mut discarded = 0usize;
+        while stream.next().await.is_some() {
+            discarded += 1;
+        }
+        discarded
+    })
+    .await;
+    match drained {
+        Ok(0) => {}
+        Ok(discarded) => {
+            tracing::debug!(discarded, "Discarded decode items after the terminal")
+        }
+        Err(_) => tracing::debug!(
+            timeout = ?DECODE_DRAIN_TIMEOUT,
+            "Decode stream did not end after its terminal; dropping it"
+        ),
+    }
+}
+
+/// Owns a decode stream whose terminal item has been released early (see
+/// [`PrefillTask::forward_decode`]). [`Self::run`]
+/// drains it in line; if the response is dropped first (client disconnect or
+/// cancellation), `Drop` hands the stream to a task that finishes the drain,
+/// the same detach-not-abort pattern as [`PrefillTask`].
+struct DecodeDrain(Option<ManyOut<Annotated<LLMEngineOutput>>>);
+
+impl DecodeDrain {
+    async fn run(&mut self) {
+        if let Some(stream) = self.0.as_mut() {
+            drain_decode(stream).await;
+        }
+        self.0 = None;
+    }
+}
+
+impl Drop for DecodeDrain {
+    fn drop(&mut self) {
+        let Some(mut stream) = self.0.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(
+                async move { drain_decode(&mut stream).await }.instrument(tracing::Span::current()),
+            );
+        }
+    }
+}
 
 /// Dropping the observer detaches the task: client disconnects must not abort a
 /// prefill whose KV transfer may still be needed by the decode worker.
@@ -107,12 +219,40 @@ impl PrefillTask {
     /// held until prefill finishes so a late failure cannot follow success.
     /// `output` sends prefill's output into the stream as soon as prefill
     /// finishes (`BeforeLast`), or before any decode output (`BeforeFirst`).
+    ///
+    /// With [`DYN_ROUTER_RELEASE_ON_KV_CONFIRMATION`], a decode that marked KV
+    /// receipt (see [`KV_TRANSFER_KEY`]) has already shown that every transfer
+    /// succeeded, so its terminal is released without waiting for the prefill
+    /// route when no prefill output must precede it. The prefill task is then
+    /// detached and still logs a late failure, and the decode stream is drained
+    /// after the terminal (bounded by [`DECODE_DRAIN_TIMEOUT`]). A decode stream
+    /// that ends without a terminal item still waits for prefill. Without the
+    /// switch or the mark, behaviour is unchanged except that the mark is always
+    /// stripped.
     pub(super) async fn forward_decode(
         self,
         decode: impl Future<Output = anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>>>,
         request_context: Arc<dyn AsyncEngineContext>,
         output: PrefillNeed,
         prefill_context: Arc<dyn AsyncEngineContext>,
+    ) -> anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>> {
+        self.forward_decode_with(
+            decode,
+            request_context,
+            output,
+            prefill_context,
+            *RELEASE_ON_KV_CONFIRMATION,
+        )
+        .await
+    }
+
+    async fn forward_decode_with(
+        self,
+        decode: impl Future<Output = anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>>>,
+        request_context: Arc<dyn AsyncEngineContext>,
+        output: PrefillNeed,
+        prefill_context: Arc<dyn AsyncEngineContext>,
+        release_on_kv_confirmation: bool,
     ) -> anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>> {
         let emit = output != PrefillNeed::None;
         let mut completion = Box::pin(self.wait());
@@ -121,7 +261,7 @@ impl PrefillTask {
             biased;
             result = &mut completion => {
                 let prefill = result.inspect_err(|_| request_context.stop_generating())?;
-                let response = decode.await?;
+                let response = strip_kv_marks(decode.await?);
                 if !emit {
                     return Ok(response);
                 }
@@ -151,7 +291,8 @@ impl PrefillTask {
                 let prefill_result = tokio::select! {
                     biased;
                     result = &mut completion => result,
-                    item = response.next() => {
+                    mut item = response.next() => {
+                        take_kv_mark(&mut item);
                         if let Some(error) = item.as_ref().and_then(|item| item.err())
                             && cancel_prefill_on_decode_rejection(&error, prefill_context.as_ref())
                         {
@@ -184,11 +325,15 @@ impl PrefillTask {
                 if decode_ended {
                     return;
                 }
-                while let Some(output) = response.next().await {
+                while let Some(mut output) = response.next().await {
+                    take_item_kv_mark(&mut output);
                     yield output;
                 }
                 return;
             }
+            // Set once the decode has marked KV receipt from every prefill rank,
+            // if this router releases on that mark.
+            let mut kv_received = false;
             loop {
                 tokio::select! {
                     biased;
@@ -204,12 +349,14 @@ impl PrefillTask {
                                 return;
                             }
                         }
-                        while let Some(output) = response.next().await {
+                        while let Some(mut output) = response.next().await {
+                            take_item_kv_mark(&mut output);
                             yield output;
                         }
                         return;
                     }
-                    output = response.next() => {
+                    mut output = response.next() => {
+                        kv_received |= take_kv_mark(&mut output) && release_on_kv_confirmation;
                         if output.as_ref().is_some_and(|output| {
                             output.err().is_some() || matches!(
                                 output.data.as_ref().and_then(|data| data.finish_reason.as_ref()),
@@ -225,7 +372,14 @@ impl PrefillTask {
                         let terminal = output.as_ref().is_none_or(|output| {
                             output.data.as_ref().is_some_and(|data| data.finish_reason.is_some())
                         });
-                        if terminal {
+                        // Release a successful terminal item early only when the
+                        // decode confirmed KV receipt and no prefill output must
+                        // precede it: every transfer has then already succeeded, and
+                        // returning below drops `completion`, which detaches the
+                        // prefill task; it still logs a failure. A decode stream that
+                        // ends without a terminal item keeps waiting for prefill.
+                        let release = terminal && !emit && kv_received && output.is_some();
+                        if terminal && !release {
                             match completion.as_mut().await {
                                 Ok(prefill) => if emit && let Some(item) = output_item(prefill) {
                                     yield item;
@@ -238,10 +392,22 @@ impl PrefillTask {
                                 }
                             }
                         }
-                        match output {
-                            Some(output) => yield output,
-                            None => return,
+                        let Some(output) = output else {
+                            return;
+                        };
+                        if release {
+                            // The early release is not ordered behind the prefill
+                            // reply, so read the decode stream to its end after the
+                            // terminal: the worker can then deliver its completion
+                            // message. The guard owns the stream across the yield and
+                            // finishes the drain in the background if the client goes
+                            // away first.
+                            let mut drain = DecodeDrain(Some(response));
+                            yield output;
+                            drain.run().await;
+                            return;
                         }
+                        yield output;
                         if terminal {
                             return;
                         }
@@ -841,5 +1007,520 @@ mod tests {
         ] {
             assert_ambiguous_decode_error_preserves_prefill(output).await;
         }
+    }
+
+    fn kv_mark() -> serde_json::Value {
+        serde_json::json!({ KV_TRANSFER_KEY: KV_TRANSFER_RECEIVED })
+    }
+
+    /// A decode output carrying the KV-receipt mark, as the SGLang decode
+    /// handler sets it on its first token.
+    fn marked(output: LLMEngineOutput) -> Annotated<LLMEngineOutput> {
+        Annotated::from_data(LLMEngineOutput {
+            disaggregated_params: Some(kv_mark()),
+            ..output
+        })
+    }
+
+    fn token(id: u32) -> LLMEngineOutput {
+        LLMEngineOutput {
+            token_ids: vec![id],
+            ..Default::default()
+        }
+    }
+
+    fn decode_of(
+        items: Vec<Annotated<LLMEngineOutput>>,
+        context: Arc<Controller>,
+    ) -> ManyOut<Annotated<LLMEngineOutput>> {
+        ResponseStream::new(Box::pin(stream::iter(items)), context)
+    }
+
+    /// Everything logged at warning level or above on this thread while the
+    /// returned guard lives. `#[tokio::test]` runs spawned tasks on this thread.
+    fn capture_warnings() -> (
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        (captured.0, tracing::subscriber::set_default(subscriber))
+    }
+
+    #[tokio::test]
+    async fn confirmed_kv_success_does_not_wait_for_prefill() {
+        let (tx, task) = pending_prefill();
+        let context = Arc::new(Controller::default());
+        let decode = decode_of(
+            vec![
+                marked(token(42)),
+                Annotated::from_data(LLMEngineOutput::length()),
+            ],
+            context.clone(),
+        );
+        let mut response = task
+            .forward_decode_with(
+                async { Ok(decode) },
+                context.clone(),
+                PrefillNeed::None,
+                Arc::new(Controller::default()),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.next().await.unwrap().data.unwrap().token_ids, [42]);
+        // Prefill is still pending, yet the terminal is ready at once.
+        let terminal = response.next().now_or_never().unwrap().unwrap();
+        assert_eq!(
+            terminal.data.unwrap().finish_reason,
+            Some(FinishReason::Length)
+        );
+        assert!(response.next().await.is_none());
+        assert!(!context.is_stopped());
+        // The detached prefill task still owns its receiver and can finish.
+        tx.send(Ok(None)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_prefill_failure_after_kv_confirmation_is_logged_not_surfaced() {
+        let (captured, _guard) = capture_warnings();
+        let (tx, rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let task = PrefillTask::spawn(
+            async move {
+                let result = rx.await.unwrap();
+                finished_tx.send(()).unwrap();
+                result
+            },
+            Arc::new(Controller::default()),
+        );
+        let context = Arc::new(Controller::default());
+        let decode = decode_of(
+            vec![
+                marked(token(42)),
+                Annotated::from_data(LLMEngineOutput::length()),
+            ],
+            context.clone(),
+        );
+        let response = task
+            .forward_decode_with(
+                async { Ok(decode) },
+                context.clone(),
+                PrefillNeed::None,
+                Arc::new(Controller::default()),
+                true,
+            )
+            .await
+            .unwrap();
+        let outputs = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            response.collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.iter().all(|output| output.err().is_none()));
+        assert_eq!(
+            outputs[1].data.as_ref().unwrap().finish_reason,
+            Some(FinishReason::Length)
+        );
+
+        tx.send(failure()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), finished_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // The failure is logged in the same poll that finished the task.
+        tokio::task::yield_now().await;
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("Prefill background task failed"), "{logs}");
+        assert!(logs.contains("prefill connection lost"), "{logs}");
+        assert!(!context.is_stopped());
+    }
+
+    #[tokio::test]
+    async fn before_last_output_still_waits_with_kv_confirmation() {
+        let (tx, task) = pending_prefill();
+        let decode = decode_of(
+            vec![
+                marked(token(7)),
+                Annotated::from_data(LLMEngineOutput::length()),
+            ],
+            Arc::new(Controller::default()),
+        );
+        let mut response = task
+            .forward_decode_with(
+                async { Ok(decode) },
+                Arc::new(Controller::default()),
+                PrefillNeed::BeforeLast,
+                Arc::new(Controller::default()),
+                true,
+            )
+            .await
+            .unwrap();
+        let first = response.next().await.unwrap().data.unwrap();
+        assert_eq!(first.token_ids, [7]);
+        assert_eq!(first.disaggregated_params, None);
+        let terminal = response.next();
+        tokio::pin!(terminal);
+        assert!((&mut terminal).now_or_never().is_none());
+        let output = serde_json::json!({"sglang_response": {}});
+        tx.send(Ok(Some(output.clone()))).unwrap();
+        let item = terminal.await.unwrap();
+        assert_eq!(item.event.as_deref(), Some(PREFILL_OUTPUT_ANNOTATION));
+        assert_eq!(item.data.unwrap().engine_data, Some(output));
+        assert_eq!(
+            response.next().await.unwrap().data.unwrap().finish_reason,
+            Some(FinishReason::Length)
+        );
+        assert!(response.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_on_terminal_item_releases_it() {
+        let (tx, task) = pending_prefill();
+        let context = Arc::new(Controller::default());
+        let decode = decode_of(
+            vec![marked(LLMEngineOutput {
+                token_ids: vec![5],
+                ..LLMEngineOutput::length()
+            })],
+            context.clone(),
+        );
+        let mut response = task
+            .forward_decode_with(
+                async { Ok(decode) },
+                context.clone(),
+                PrefillNeed::None,
+                Arc::new(Controller::default()),
+                true,
+            )
+            .await
+            .unwrap();
+        let terminal = response.next().now_or_never().unwrap().unwrap();
+        let terminal = terminal.data.unwrap();
+        assert_eq!(terminal.token_ids, [5]);
+        assert_eq!(terminal.finish_reason, Some(FinishReason::Length));
+        assert_eq!(terminal.disaggregated_params, None);
+        assert!(response.next().await.is_none());
+        tx.send(Ok(None)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mark_without_opt_in_keeps_the_hold() {
+        let (tx, task) = pending_prefill();
+        let context = Arc::new(Controller::default());
+        let decode = decode_of(
+            vec![
+                marked(token(42)),
+                Annotated::from_data(LLMEngineOutput::length()),
+            ],
+            context.clone(),
+        );
+        let mut response = task
+            .forward_decode_with(
+                async { Ok(decode) },
+                context.clone(),
+                PrefillNeed::None,
+                Arc::new(Controller::default()),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.next().await.unwrap().data.unwrap().token_ids, [42]);
+        assert!(response.next().now_or_never().is_none());
+        tx.send(failure()).unwrap();
+        assert!(response.next().await.unwrap().err().is_some());
+        assert!(response.next().await.is_none());
+        assert!(context.is_stopped());
+    }
+
+    /// The mark is router-internal: `/inference/v1/generate` would otherwise
+    /// return a terminal item's `disaggregated_params` as `kv_transfer_params`.
+    #[tokio::test]
+    async fn mark_is_stripped_before_client() {
+        let other =
+            serde_json::json!({ "bootstrap_room": 7, KV_TRANSFER_KEY: KV_TRANSFER_RECEIVED });
+        let items = || {
+            vec![
+                marked(token(1)),
+                Annotated::from_data(LLMEngineOutput {
+                    disaggregated_params: Some(other.clone()),
+                    ..token(2)
+                }),
+                marked(LLMEngineOutput::length()),
+            ]
+        };
+        for release in [false, true] {
+            for output in [
+                PrefillNeed::None,
+                PrefillNeed::BeforeLast,
+                PrefillNeed::BeforeFirst,
+            ] {
+                for prefill_first in [false, true] {
+                    let case = format!(
+                        "release={release} output={output:?} prefill_first={prefill_first}"
+                    );
+                    let (tx, task) = pending_prefill();
+                    let mut tx = Some(tx);
+                    if prefill_first {
+                        tx.take().unwrap().send(Ok(None)).unwrap();
+                        tokio::task::yield_now().await;
+                    }
+                    let context = Arc::new(Controller::default());
+                    let decode = decode_of(items(), context.clone());
+                    let response = task
+                        .forward_decode_with(
+                            async { Ok(decode) },
+                            context,
+                            output,
+                            Arc::new(Controller::default()),
+                            release,
+                        )
+                        .await
+                        .unwrap();
+                    if let Some(tx) = tx {
+                        tx.send(Ok(None)).unwrap();
+                    }
+                    let outputs = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        response.collect::<Vec<_>>(),
+                    )
+                    .await
+                    .unwrap();
+                    let params: Vec<_> = outputs
+                        .into_iter()
+                        .map(|output| output.data.unwrap().disaggregated_params)
+                        .collect();
+                    assert_eq!(
+                        params,
+                        [None, Some(serde_json::json!({ "bootstrap_room": 7 })), None],
+                        "{case}"
+                    );
+                }
+            }
+        }
+
+        // Without a prefill observer the router forwards decode as is, minus the mark.
+        let context = Arc::new(Controller::default());
+        let outputs: Vec<_> = strip_kv_marks(decode_of(items(), context))
+            .map(|output| output.data.unwrap().disaggregated_params)
+            .collect()
+            .await;
+        assert_eq!(
+            outputs,
+            [None, Some(serde_json::json!({ "bootstrap_room": 7 })), None]
+        );
+    }
+
+    /// A decode stream that yields `items`, then waits for `gate` (if any), then
+    /// reports on `finished` that it was read to its end.
+    fn signalling_decode(
+        items: Vec<Annotated<LLMEngineOutput>>,
+        gate: Option<oneshot::Receiver<()>>,
+        finished: oneshot::Sender<()>,
+    ) -> ManyOut<Annotated<LLMEngineOutput>> {
+        let stream = async_stream::stream! {
+            for item in items {
+                yield item;
+            }
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            let _ = finished.send(());
+        };
+        ResponseStream::new(Box::pin(stream), Arc::new(Controller::default()))
+    }
+
+    #[tokio::test]
+    async fn terminal_is_followed_by_full_decode_drain() {
+        // Only the early-release path drains after the terminal.
+        let (_tx, task) = pending_prefill();
+        let (finished_tx, mut finished_rx) = oneshot::channel();
+        let decode = signalling_decode(
+            vec![
+                marked(token(1)),
+                Annotated::from_data(LLMEngineOutput::length()),
+                // Anything after the terminal is read and discarded.
+                Annotated::from_data(token(2)),
+            ],
+            None,
+            finished_tx,
+        );
+        let mut response = task
+            .forward_decode_with(
+                async { Ok(decode) },
+                Arc::new(Controller::default()),
+                PrefillNeed::None,
+                Arc::new(Controller::default()),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.next().await.unwrap().data.unwrap().token_ids, [1]);
+        // Prefill stays pending: the terminal is released on the mark alone.
+        let rest = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            response.collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(
+            rest[0].data.as_ref().unwrap().finish_reason,
+            Some(FinishReason::Length)
+        );
+        // The stream ended only after the decode was read to its end.
+        assert!(finished_rx.try_recv().is_ok());
+    }
+
+    /// With the switch off, the hold path behaves as before this change: the
+    /// response ends right after the held terminal, without reading the decode
+    /// stream any further.
+    #[tokio::test]
+    async fn default_path_is_unchanged_without_switch() {
+        let (tx, task) = pending_prefill();
+        // The decode stream never ends after its terminal unless the gate opens.
+        let (_gate_tx, gate_rx) = oneshot::channel();
+        let (finished_tx, mut finished_rx) = oneshot::channel();
+        let decode = signalling_decode(
+            vec![
+                marked(token(1)),
+                Annotated::from_data(LLMEngineOutput::length()),
+                Annotated::from_data(token(2)),
+            ],
+            Some(gate_rx),
+            finished_tx,
+        );
+        let mut response = task
+            .forward_decode_with(
+                async { Ok(decode) },
+                Arc::new(Controller::default()),
+                PrefillNeed::None,
+                Arc::new(Controller::default()),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.next().await.unwrap().data.unwrap().token_ids, [1]);
+        // The terminal is held until prefill completes.
+        let terminal = response.next();
+        tokio::pin!(terminal);
+        assert!((&mut terminal).now_or_never().is_none());
+        tx.send(Ok(None)).unwrap();
+        let terminal = terminal.await.unwrap().data.unwrap();
+        assert_eq!(terminal.finish_reason, Some(FinishReason::Length));
+        assert_eq!(terminal.disaggregated_params, None);
+        // No drain wait: the response ends at once, and the decode stream was
+        // not read past its terminal.
+        assert!(response.next().now_or_never().unwrap().is_none());
+        assert!(finished_rx.try_recv().is_err());
+    }
+
+    /// With the switch on, a decode stream that ends without a terminal item
+    /// after the mark still waits for prefill, and a prefill failure is surfaced.
+    #[tokio::test]
+    async fn decode_end_without_terminal_still_waits_for_prefill() {
+        let (tx, task) = pending_prefill();
+        let context = Arc::new(Controller::default());
+        let decode = decode_of(vec![marked(token(1))], context.clone());
+        let mut response = task
+            .forward_decode_with(
+                async { Ok(decode) },
+                context.clone(),
+                PrefillNeed::None,
+                Arc::new(Controller::default()),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.next().await.unwrap().data.unwrap().token_ids, [1]);
+        let end = response.next();
+        tokio::pin!(end);
+        assert!((&mut end).now_or_never().is_none());
+        tx.send(failure()).unwrap();
+        assert!(end.await.unwrap().err().is_some());
+        assert!(response.next().await.is_none());
+        assert!(context.is_stopped());
+    }
+
+    #[tokio::test]
+    async fn client_drop_during_drain_still_drains() {
+        let (_tx, task) = pending_prefill();
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let decode = signalling_decode(
+            vec![marked(LLMEngineOutput {
+                token_ids: vec![1],
+                ..LLMEngineOutput::length()
+            })],
+            Some(gate_rx),
+            finished_tx,
+        );
+        let mut response = task
+            .forward_decode_with(
+                async { Ok(decode) },
+                Arc::new(Controller::default()),
+                PrefillNeed::None,
+                Arc::new(Controller::default()),
+                true,
+            )
+            .await
+            .unwrap();
+        let terminal = response.next().await.unwrap();
+        assert!(terminal.data.unwrap().finish_reason.is_some());
+        // The in-line drain is now waiting on the worker.
+        assert!(response.next().now_or_never().is_none());
+        drop(response);
+        gate_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), finished_rx)
+            .await
+            .expect("background drain did not finish")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_is_bounded_by_timeout() {
+        let (_tx, task) = pending_prefill();
+        let context = Arc::new(Controller::default());
+        let decode: ManyOut<Annotated<LLMEngineOutput>> = ResponseStream::new(
+            Box::pin(stream::iter([marked(LLMEngineOutput::length())]).chain(stream::pending())),
+            context.clone(),
+        );
+        let response = task
+            .forward_decode_with(
+                async { Ok(decode) },
+                context,
+                PrefillNeed::None,
+                Arc::new(Controller::default()),
+                true,
+            )
+            .await
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let outputs = tokio::time::timeout(DECODE_DRAIN_TIMEOUT * 2, response.collect::<Vec<_>>())
+            .await
+            .expect("drain was not bounded");
+        assert_eq!(outputs.len(), 1);
+        assert!(start.elapsed() >= DECODE_DRAIN_TIMEOUT);
     }
 }

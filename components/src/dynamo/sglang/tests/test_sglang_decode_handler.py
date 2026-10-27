@@ -27,6 +27,7 @@ from dynamo.sglang.protocol import (
     StopConditions,
 )
 from dynamo.sglang.request_handlers.llm.decode_handler import (
+    KV_TRANSFER_RECEIVED_MARK,
     DecodeWorkerHandler,
     _extract_sglang_stop_reason,
     _kv_cache_hit_engine_data,
@@ -2120,6 +2121,49 @@ async def test_process_token_stream_reports_kv_cache_hit_on_final_chunk_only(
     # Disaggregated decode would only echo the prefill worker's hit.
     expected = {"prompt_tokens": 4, "reused_tokens": 3} if reports else None
     assert chunks[1].get("engine_data", {}).get("kv_cache_hit") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("serving_mode", "marks"),
+    [(DisaggregationMode.AGGREGATED, False), (DisaggregationMode.DECODE, True)],
+)
+async def test_process_token_stream_marks_kv_receipt_on_first_output_only(
+    serving_mode, marks
+):
+    """A disaggregated decode token proves KV receipt; only the first carries it."""
+    handler = _new_decode_handler(serving_mode=serving_mode)
+
+    def chunk(output_ids, finish_reason=None):
+        return {
+            "index": 0,
+            "output_ids": output_ids,
+            "meta_info": {
+                "id": "sglang-1",
+                "finish_reason": finish_reason,
+                "prompt_tokens": 4,
+            },
+        }
+
+    chunks = await _collect(
+        handler._process_token_stream(
+            _stream(
+                [
+                    # An empty non-final chunk is no output and carries no mark.
+                    chunk([]),
+                    chunk([101]),
+                    chunk([102]),
+                    chunk([103], {"type": "stop"}),
+                ]
+            ),
+            _Context(),
+        )
+    )
+
+    assert [chunk["token_ids"] for chunk in chunks] == [[101], [102], [103]]
+    expected = KV_TRANSFER_RECEIVED_MARK if marks else None
+    assert chunks[0].get("disaggregated_params") == expected
+    assert all("disaggregated_params" not in chunk for chunk in chunks[1:])
 
 
 @pytest.mark.asyncio

@@ -844,6 +844,12 @@ pub mod router {
 
     /// Stale active-request cleanup guard in seconds; this is not a request timeout.
     pub const DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS: &str = "DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS";
+
+    /// Disaggregated serving: release a successful decode terminal once the decode
+    /// worker has marked KV receipt, instead of holding it until the prefill route
+    /// completes. Off by default. Truthy values are `1`, `true`, `yes`, or `on`; the
+    /// value is read once per process.
+    pub const DYN_ROUTER_RELEASE_ON_KV_CONFIRMATION: &str = "DYN_ROUTER_RELEASE_ON_KV_CONFIRMATION";
 }
 
 /// Request plane transport environment variables
@@ -1258,6 +1264,7 @@ mod tests {
             router::DYN_ROUTER_QUEUE_POLICY,
             router::DYN_ROUTER_POLICY_CONFIG,
             router::DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS,
+            router::DYN_ROUTER_RELEASE_ON_KV_CONFIRMATION,
             request_plane::DYN_REQUEST_PLANE,
             request_plane::DYN_REQUEST_PLANE_CODEC,
             response_plane::DYN_RESPONSE_PLANE,

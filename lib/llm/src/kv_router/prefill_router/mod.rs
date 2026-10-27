@@ -701,7 +701,7 @@ impl
                     .forward_decode(decode, engine_ctx, output, prefill_engine_ctx)
                     .await
             }
-            None => decode.await,
+            None => decode.await.map(handoff::strip_kv_marks),
         }
     }
 }

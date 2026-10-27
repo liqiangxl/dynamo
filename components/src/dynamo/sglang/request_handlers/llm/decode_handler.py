@@ -69,6 +69,10 @@ _SAMPLING_OPTION_FIELDS = (
     "min_p",
 )
 BYPASS_REMOTE_PREFILL_ANNOTATION = "x-bypass-remote-prefill"
+# Set on a disaggregated decode's first output item to confirm KV receipt from
+# every prefill rank. Mirrors KV_TRANSFER_KEY / KV_TRANSFER_RECEIVED in the
+# Rust prefill router (kv_router/prefill_router/handoff.rs), which strips it.
+KV_TRANSFER_RECEIVED_MARK = {"kv_transfer": "received"}
 _MAX_ABORT_MESSAGE_LENGTH = 8192
 
 
@@ -1126,6 +1130,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 if output_ids and not first_output_seen:
                     first_output_seen = True
                     context.notify_first_token()
+                    if self.serving_mode == DisaggregationMode.DECODE:
+                        # SGLang emits no decode token before KVPoll.Success, which
+                        # needs a Success from every expected prefill rank and
+                        # agreement across the decode's TP group. The prefill router
+                        # may then release the final item without waiting for the
+                        # prefill reply, and strips this mark before the client.
+                        out["disaggregated_params"] = dict(KV_TRANSFER_RECEIVED_MARK)
 
                 # Pass through disjoint token segments directly
                 out["token_ids"] = output_ids
