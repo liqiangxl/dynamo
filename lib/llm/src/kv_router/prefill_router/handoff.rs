@@ -6,7 +6,6 @@
 use std::{
     future::Future,
     sync::{Arc, LazyLock},
-    time::Duration,
 };
 
 use dynamo_runtime::{
@@ -74,65 +73,6 @@ pub(super) fn strip_kv_marks(
         item
     });
     ResponseStream::new(Box::pin(stream), context)
-}
-
-/// Upper bound on draining a decode stream after its early-released terminal
-/// item (only that path drains; the default hold path is unchanged). The worker
-/// sends its stream-level completion right after the terminal, so the drain
-/// normally ends at once; the bound only protects against a stalled worker.
-const DECODE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Read a decode stream to its end, discarding items, for at most
-/// [`DECODE_DRAIN_TIMEOUT`]. Dropping a stream before the worker's completion
-/// message arrives makes the worker log a failed publish of its final message.
-async fn drain_decode(stream: &mut ManyOut<Annotated<LLMEngineOutput>>) {
-    let drained = tokio::time::timeout(DECODE_DRAIN_TIMEOUT, async {
-        let mut discarded = 0usize;
-        while stream.next().await.is_some() {
-            discarded += 1;
-        }
-        discarded
-    })
-    .await;
-    match drained {
-        Ok(0) => {}
-        Ok(discarded) => {
-            tracing::debug!(discarded, "Discarded decode items after the terminal")
-        }
-        Err(_) => tracing::debug!(
-            timeout = ?DECODE_DRAIN_TIMEOUT,
-            "Decode stream did not end after its terminal; dropping it"
-        ),
-    }
-}
-
-/// Owns a decode stream whose terminal item has been released early (see
-/// [`PrefillTask::forward_decode`]). [`Self::run`]
-/// drains it in line; if the response is dropped first (client disconnect or
-/// cancellation), `Drop` hands the stream to a task that finishes the drain,
-/// the same detach-not-abort pattern as [`PrefillTask`].
-struct DecodeDrain(Option<ManyOut<Annotated<LLMEngineOutput>>>);
-
-impl DecodeDrain {
-    async fn run(&mut self) {
-        if let Some(stream) = self.0.as_mut() {
-            drain_decode(stream).await;
-        }
-        self.0 = None;
-    }
-}
-
-impl Drop for DecodeDrain {
-    fn drop(&mut self) {
-        let Some(mut stream) = self.0.take() else {
-            return;
-        };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(
-                async move { drain_decode(&mut stream).await }.instrument(tracing::Span::current()),
-            );
-        }
-    }
 }
 
 /// Dropping the observer detaches the task: client disconnects must not abort a
@@ -224,11 +164,10 @@ impl PrefillTask {
     /// receipt (see [`KV_TRANSFER_KEY`]) has already shown that every transfer
     /// succeeded, so its terminal is released without waiting for the prefill
     /// route when no prefill output must precede it. The prefill task is then
-    /// detached and still logs a late failure, and the decode stream is drained
-    /// after the terminal (bounded by [`DECODE_DRAIN_TIMEOUT`]). A decode stream
-    /// that ends without a terminal item still waits for prefill. Without the
-    /// switch or the mark, behaviour is unchanged except that the mark is always
-    /// stripped.
+    /// detached and still logs a late failure, and the rest of the decode stream
+    /// is drained in a detached task. A decode stream that ends without a
+    /// terminal item still waits for prefill. Without the switch or the mark,
+    /// behaviour is unchanged except that the mark is always stripped.
     pub(super) async fn forward_decode(
         self,
         decode: impl Future<Output = anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>>>,
@@ -396,15 +335,12 @@ impl PrefillTask {
                             return;
                         };
                         if release {
-                            // The early release is not ordered behind the prefill
-                            // reply, so read the decode stream to its end after the
-                            // terminal: the worker can then deliver its completion
-                            // message. The guard owns the stream across the yield and
-                            // finishes the drain in the background if the client goes
-                            // away first.
-                            let mut drain = DecodeDrain(Some(response));
+                            // Drain the decode stream so the worker's final publish completes.
+                            tokio::spawn(
+                                async move { while response.next().await.is_some() {} }
+                                    .instrument(tracing::Span::current()),
+                            );
                             yield output;
-                            drain.run().await;
                             return;
                         }
                         yield output;
@@ -1352,10 +1288,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_is_followed_by_full_decode_drain() {
-        // Only the early-release path drains after the terminal.
+    async fn decode_stream_is_fully_consumed_after_early_release() {
         let (_tx, task) = pending_prefill();
-        let (finished_tx, mut finished_rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
         let decode = signalling_decode(
             vec![
                 marked(token(1)),
@@ -1366,7 +1301,7 @@ mod tests {
             None,
             finished_tx,
         );
-        let mut response = task
+        let response = task
             .forward_decode_with(
                 async { Ok(decode) },
                 Arc::new(Controller::default()),
@@ -1376,21 +1311,21 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.next().await.unwrap().data.unwrap().token_ids, [1]);
-        // Prefill stays pending: the terminal is released on the mark alone.
-        let rest = tokio::time::timeout(
+        let outputs = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             response.collect::<Vec<_>>(),
         )
         .await
         .unwrap();
-        assert_eq!(rest.len(), 1);
+        assert_eq!(outputs.len(), 2);
         assert_eq!(
-            rest[0].data.as_ref().unwrap().finish_reason,
+            outputs[1].data.as_ref().unwrap().finish_reason,
             Some(FinishReason::Length)
         );
-        // The stream ended only after the decode was read to its end.
-        assert!(finished_rx.try_recv().is_ok());
+        tokio::time::timeout(std::time::Duration::from_secs(1), finished_rx)
+            .await
+            .expect("decode stream was not drained")
+            .unwrap();
     }
 
     /// With the switch off, the hold path behaves as before this change: the
@@ -1461,66 +1396,5 @@ mod tests {
         assert!(end.await.unwrap().err().is_some());
         assert!(response.next().await.is_none());
         assert!(context.is_stopped());
-    }
-
-    #[tokio::test]
-    async fn client_drop_during_drain_still_drains() {
-        let (_tx, task) = pending_prefill();
-        let (gate_tx, gate_rx) = oneshot::channel();
-        let (finished_tx, finished_rx) = oneshot::channel();
-        let decode = signalling_decode(
-            vec![marked(LLMEngineOutput {
-                token_ids: vec![1],
-                ..LLMEngineOutput::length()
-            })],
-            Some(gate_rx),
-            finished_tx,
-        );
-        let mut response = task
-            .forward_decode_with(
-                async { Ok(decode) },
-                Arc::new(Controller::default()),
-                PrefillNeed::None,
-                Arc::new(Controller::default()),
-                true,
-            )
-            .await
-            .unwrap();
-        let terminal = response.next().await.unwrap();
-        assert!(terminal.data.unwrap().finish_reason.is_some());
-        // The in-line drain is now waiting on the worker.
-        assert!(response.next().now_or_never().is_none());
-        drop(response);
-        gate_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), finished_rx)
-            .await
-            .expect("background drain did not finish")
-            .unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn drain_is_bounded_by_timeout() {
-        let (_tx, task) = pending_prefill();
-        let context = Arc::new(Controller::default());
-        let decode: ManyOut<Annotated<LLMEngineOutput>> = ResponseStream::new(
-            Box::pin(stream::iter([marked(LLMEngineOutput::length())]).chain(stream::pending())),
-            context.clone(),
-        );
-        let response = task
-            .forward_decode_with(
-                async { Ok(decode) },
-                context,
-                PrefillNeed::None,
-                Arc::new(Controller::default()),
-                true,
-            )
-            .await
-            .unwrap();
-        let start = tokio::time::Instant::now();
-        let outputs = tokio::time::timeout(DECODE_DRAIN_TIMEOUT * 2, response.collect::<Vec<_>>())
-            .await
-            .expect("drain was not bounded");
-        assert_eq!(outputs.len(), 1);
-        assert!(start.elapsed() >= DECODE_DRAIN_TIMEOUT);
     }
 }
