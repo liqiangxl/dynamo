@@ -20,7 +20,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll, ready},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -92,6 +92,69 @@ struct DecoderState<S> {
     /// When `false`, `jailed_text` is left unset on every chunk rather than snapshotting the
     /// decoder's withheld state for a checkpoint nothing can ever consume.
     migration_possible: bool,
+    /// Set once every requested choice has received a complete engine terminal (see
+    /// [`is_complete_terminal`]). The response then ends after the current item, and the rest
+    /// of the engine stream is drained in a detached task (see [`drain_after_response`]).
+    ended_at_terminal: bool,
+}
+
+/// How long the detached task may read the engine stream after the response ended at a
+/// complete terminal, before it kills the request.
+const POST_TERMINAL_DRAIN_LIMIT: Duration = Duration::from_secs(60);
+
+/// Whether an engine chunk, as the Backend emits it, is a clean terminal that already carries
+/// the choice's usage, so nothing later in the engine stream can change the choice's tokens,
+/// finish reason or usage: chunks for a finished choice are skipped, and only an engine that
+/// sends usage in a separate trailing chunk would add any, which this check excludes.
+fn is_complete_terminal(data: &LLMEngineOutput) -> bool {
+    data.completion_usage.is_some()
+        && matches!(
+            data.finish_reason,
+            Some(FinishReason::EoS | FinishReason::Length | FinishReason::Stop)
+        )
+}
+
+/// Reads the rest of an engine stream to its end in a detached task, after the response ended
+/// at a complete terminal.
+///
+/// Dropping the stream would cancel the request: the worker would abort it and the router
+/// would record a cancelled route. Draining lets the worker's teardown, its final message, the
+/// router's bookkeeping and a disaggregated prefill reply finish exactly as before, only after
+/// the client already has the whole response. Errors after this point can no longer reach the
+/// client, so they are logged. The client is served, so nothing else would ever cancel a worker
+/// that stalls after its final item: the drain is bounded, and then the request is killed.
+fn drain_after_response<S>(mut stream: S)
+where
+    S: Stream<Item = Annotated<LLMEngineOutput>>
+        + AsyncEngineContextProvider
+        + Unpin
+        + Send
+        + 'static,
+{
+    let context = stream.context();
+    tokio::spawn(async move {
+        let drain = async {
+            while let Some(item) = stream.next().await {
+                if item.is_error() {
+                    tracing::warn!(
+                        request_id = context.id(),
+                        "engine error after the response ended: {:?}",
+                        item.error
+                    );
+                }
+            }
+        };
+        if tokio::time::timeout(POST_TERMINAL_DRAIN_LIMIT, drain)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                request_id = context.id(),
+                "engine stream did not end within {POST_TERMINAL_DRAIN_LIMIT:?} after the response ended; killing it"
+            );
+            context.kill();
+        }
+    });
 }
 
 /// Decodes one vocabulary ID for per-token logprob metadata.
@@ -229,6 +292,7 @@ impl Backend {
             pending_flush: Vec::new(),
             stream_ended: false,
             migration_possible: params.migration_possible,
+            ended_at_terminal: false,
         })
     }
 }
@@ -274,7 +338,11 @@ struct DecoderStream<S> {
 
 impl<S> Stream for DecoderStream<S>
 where
-    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + Unpin,
+    S: Stream<Item = Annotated<LLMEngineOutput>>
+        + AsyncEngineContextProvider
+        + Unpin
+        + Send
+        + 'static,
 {
     type Item = Annotated<BackendOutput>;
 
@@ -283,7 +351,16 @@ where
             return Poll::Ready(None);
         };
         match ready!(state.poll_step(cx)) {
-            Some(output) => Poll::Ready(Some(backend_output(output))),
+            Some(output) => {
+                if state.ended_at_terminal
+                    && let Some(state) = self.state.take()
+                {
+                    // Every requested choice is complete: end the response after this item,
+                    // without waiting for the engine stream's own end.
+                    drain_after_response(state.stream);
+                }
+                Poll::Ready(Some(backend_output(output)))
+            }
             None => {
                 self.state = None;
                 Poll::Ready(None)
@@ -296,6 +373,23 @@ impl<S> DecoderState<S>
 where
     S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + Unpin,
 {
+    /// Records a complete engine terminal (see [`is_complete_terminal`]) for `choice_idx`.
+    /// Once every requested choice has finished, the response ends after this item.
+    ///
+    /// Only requested choices count, so an out-of-range index can never complete the set while
+    /// a real choice is still running. A choice that already finished another way (a local
+    /// stop, an error) counts as finished, as it does for the local-stop check.
+    fn record_complete_terminal(&mut self, choice_idx: u32) {
+        if !self.decoders.contains_key(&choice_idx) {
+            return;
+        }
+        self.finished_choices.insert(choice_idx);
+        self.ended_at_terminal = self
+            .decoders
+            .keys()
+            .all(|idx| self.finished_choices.contains(idx));
+    }
+
     /// The next item, detokenized in place, or `None` when the stream has ended.
     fn poll_step(&mut self, cx: &mut TaskContext<'_>) -> Poll<Option<Annotated<LLMEngineOutput>>> {
         // If we've already detected a local stop condition, end the stream
@@ -472,11 +566,19 @@ where
                             data.jailed_text = decoder.checkpoint();
                         }
                     }
+                    // The decoder's withheld text was flushed into this chunk above, so a
+                    // complete terminal leaves nothing behind for this choice.
+                    if has_finish && output.data.as_ref().is_some_and(is_complete_terminal) {
+                        self.record_complete_terminal(choice_idx);
+                    }
                     return Poll::Ready(Some(output));
                 }
 
                 let data = output.data.as_mut().unwrap();
                 let choice_idx = data.index.unwrap_or(0);
+                // Only a terminal the engine sent can end the response early. A local stop
+                // (below) instead stops the engine, as before.
+                let engine_terminal = data.finish_reason.is_some();
                 // Snapshot the choice count before borrowing a specific decoder mutably
                 // below: that borrow stays alive until this choice's `checkpoint()` call
                 // near the end of this arm, so `self.decoders` can't be read again
@@ -619,6 +721,11 @@ where
                 // checkpoint, so there is no reason to allocate a snapshot of it.
                 if self.migration_possible {
                     data.jailed_text = decoder.checkpoint();
+                }
+
+                // `decoder.finish()` above flushed this choice's withheld text into this chunk.
+                if engine_terminal && is_complete_terminal(data) {
+                    self.record_complete_terminal(choice_idx);
                 }
 
                 Poll::Ready(Some(output))
@@ -3139,5 +3246,234 @@ mod tests {
             vec![FinishReason::Error("worker failed".to_string())],
             "the worker's error must survive a local EOS stop in the same chunk: {outputs:?}"
         );
+    }
+
+    fn usage() -> dynamo_protocols::types::CompletionUsage {
+        dynamo_protocols::types::CompletionUsage {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+            total_tokens: 5,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        }
+    }
+
+    /// One engine chunk for choice `index`, optionally terminal and with usage.
+    fn engine_chunk(
+        token_ids: Vec<TokenIdType>,
+        index: u32,
+        finish_reason: Option<FinishReason>,
+        with_usage: bool,
+    ) -> Annotated<LLMEngineOutput> {
+        Annotated::from_data(LLMEngineOutput {
+            token_ids,
+            index: Some(index),
+            finish_reason,
+            completion_usage: with_usage.then(usage),
+            ..Default::default()
+        })
+    }
+
+    /// Sends `chunks`, then holds its stream open until `release` fires (or forever without
+    /// one); `drained` records that the stream was read to its end.
+    struct HeldOpenEngine {
+        chunks: Vec<Annotated<LLMEngineOutput>>,
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        drained: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for HeldOpenEngine
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            let release = self.release.lock().unwrap().take().expect("one request");
+            let drained = self.drained.clone();
+            let close = futures::stream::once(async move {
+                let _ = release.await;
+                drained.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .filter_map(|()| async { None::<Annotated<LLMEngineOutput>> });
+            Ok(ResponseStream::new(
+                Box::pin(futures::stream::iter(self.chunks.clone()).chain(close)),
+                request.context(),
+            ))
+        }
+    }
+
+    /// Backend's response to `request` from a [`HeldOpenEngine`] sending `chunks`, the sender
+    /// that lets the engine's stream end, and the flag that says it was read to its end.
+    async fn held_open_response(
+        request: PreprocessedRequest,
+        chunks: Vec<Annotated<LLMEngineOutput>>,
+    ) -> (
+        ManyOut<Annotated<BackendOutput>>,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (release, rx) = tokio::sync::oneshot::channel();
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(JailingTokenizer);
+        let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
+        let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
+            Arc::new(HeldOpenEngine {
+                chunks,
+                release: std::sync::Mutex::new(Some(rx)),
+                drained: drained.clone(),
+            });
+        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+            .await
+            .expect("backend generation succeeds");
+        (stream, release, drained)
+    }
+
+    async fn wait_for(flag: &std::sync::atomic::AtomicBool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("flag set");
+    }
+
+    /// A terminal chunk that carries usage ends the response at once, with the decoder's
+    /// withheld text flushed into it; the rest of the engine stream is still read to its end
+    /// (not dropped, which would cancel the request).
+    #[tokio::test]
+    async fn backend_ends_at_complete_terminal_and_drains_the_engine_stream() {
+        let (stream, release, drained) = held_open_response(
+            jailing_request(1),
+            vec![
+                engine_chunk(vec![1], 0, None, false),
+                // "STOP" is withheld as a partial match of the stop string "STOPPED".
+                engine_chunk(vec![2], 0, None, false),
+                engine_chunk(vec![], 0, Some(FinishReason::Length), true),
+            ],
+        )
+        .await;
+        let context = stream.context();
+        let outputs: Vec<_> =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.collect())
+                .await
+                .expect("the response must end at the terminal, not at the engine's close");
+
+        let data: Vec<_> = outputs.iter().filter_map(|o| o.data.as_ref()).collect();
+        assert_eq!(data.len(), 3, "{outputs:?}");
+        assert_eq!(data[2].finish_reason, Some(FinishReason::Length));
+        assert_eq!(
+            data[2].completion_usage.as_ref().map(|u| u.total_tokens),
+            Some(5)
+        );
+        assert_eq!(
+            data.iter()
+                .filter_map(|d| d.text.as_deref())
+                .collect::<String>(),
+            "abcSTOP"
+        );
+
+        assert!(!drained.load(std::sync::atomic::Ordering::SeqCst));
+        release
+            .send(())
+            .expect("the drain task still holds the engine stream");
+        wait_for(&drained).await;
+        // A graceful end is not a cancellation.
+        assert!(!context.is_stopped() && !context.is_killed());
+    }
+
+    /// Without usage on the terminal chunk, a later chunk could still carry it, so the
+    /// response keeps waiting for the engine stream to end.
+    #[tokio::test]
+    async fn backend_waits_for_engine_close_when_terminal_lacks_usage() {
+        let (mut stream, release, drained) = held_open_response(
+            jailing_request(1),
+            vec![
+                engine_chunk(vec![1], 0, None, false),
+                engine_chunk(vec![1], 0, Some(FinishReason::Stop), false),
+            ],
+        )
+        .await;
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_some());
+        let pending =
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await;
+        assert!(
+            pending.is_err(),
+            "must still wait for the engine stream: {pending:?}"
+        );
+
+        release.send(()).expect("engine stream still open");
+        assert!(stream.next().await.is_none());
+        assert!(drained.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// With n > 1 the response ends only once every requested choice has a complete
+    /// terminal; a terminal for an index that was never requested does not count.
+    #[tokio::test]
+    async fn backend_ends_early_only_once_every_requested_choice_is_complete() {
+        let (mut stream, release, _drained) = held_open_response(
+            jailing_request(2),
+            vec![
+                engine_chunk(vec![1], 0, Some(FinishReason::EoS), true),
+                engine_chunk(vec![1], 1, None, false),
+            ],
+        )
+        .await;
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_some());
+        let pending =
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await;
+        assert!(pending.is_err(), "choice 1 is unfinished: {pending:?}");
+        drop(release);
+        assert!(stream.next().await.is_none());
+
+        // An out-of-range terminal goes through the engine-text path (the decoder path
+        // rejects it as an error); it must not stand in for choice 1.
+        let mut out_of_range = engine_chunk(vec![1], 2, Some(FinishReason::Stop), true);
+        out_of_range.data.as_mut().unwrap().text = Some("abc".to_string());
+        let (stream, release, drained) = held_open_response(
+            jailing_request(2),
+            vec![
+                engine_chunk(vec![1], 0, Some(FinishReason::EoS), true),
+                out_of_range,
+                engine_chunk(vec![1], 1, Some(FinishReason::Stop), true),
+            ],
+        )
+        .await;
+        let outputs: Vec<_> =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.collect())
+                .await
+                .expect("both requested choices are complete");
+        let finished: Vec<_> = outputs
+            .iter()
+            .filter_map(|o| o.data.as_ref())
+            .filter(|d| d.finish_reason.is_some())
+            .map(|d| d.index)
+            .collect();
+        assert_eq!(finished, [Some(0), Some(2), Some(1)], "{outputs:?}");
+        release.send(()).expect("drain task still holds the stream");
+        wait_for(&drained).await;
+    }
+
+    /// A worker that never ends its stream after the response ended is killed once the
+    /// drain limit passes.
+    #[tokio::test(start_paused = true)]
+    async fn backend_kills_a_stalled_engine_stream_after_the_drain_limit() {
+        let (stream, _release, drained) = held_open_response(
+            jailing_request(1),
+            vec![engine_chunk(vec![1], 0, Some(FinishReason::Stop), true)],
+        )
+        .await;
+        let context = stream.context();
+        let outputs: Vec<_> = stream.collect().await;
+        assert_eq!(outputs.len(), 1, "{outputs:?}");
+        tokio::time::sleep(POST_TERMINAL_DRAIN_LIMIT - std::time::Duration::from_secs(1)).await;
+        assert!(!context.is_killed());
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(context.is_killed());
+        assert!(!drained.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
